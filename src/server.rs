@@ -34,9 +34,10 @@ pub async fn start(config: Config, db: Db) -> Result<(), String> {
     let name = config.server.name.clone();
 
     let port = config.server.port;
+    let max_body_bytes = (config.media.max_file_size_mb as usize) * 1024 * 1024;
     let state = AppState { db, config, hub, nonces, group_public_key };
 
-    let app = build_router(state);
+    let app = build_router(state, max_body_bytes);
 
     info!("Starting ONYX group server '{}' on {}", name, addr);
 
@@ -117,7 +118,7 @@ async fn print_available_addresses(port: u16) {
     println!();
 }
 
-fn build_router(state: AppState) -> Router {
+fn build_router(state: AppState, max_body_bytes: usize) -> Router {
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/info", get(info::get_info))
@@ -169,6 +170,6 @@ fn build_router(state: AppState) -> Router {
         .merge(public_routes)
         .merge(auth_routes)
         .layer(CorsLayer::permissive())
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))  // 100MB limit for file uploads
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
