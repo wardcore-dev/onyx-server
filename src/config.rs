@@ -91,6 +91,10 @@ pub struct SecurityConfig {
     pub max_joins_per_minute: u32,
     #[serde(default)]
     pub require_approval: bool,
+    /// Explicit list of allowed CORS origins (e.g. ["https://app.example.com"]).
+    /// If empty, falls back to public_url when set, otherwise allows any origin.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_name() -> String { "My ONYX Server".into() }
@@ -161,6 +165,7 @@ impl Default for SecurityConfig {
             max_messages_per_minute: default_rate_msg(),
             max_joins_per_minute: default_rate_join(),
             require_approval: false,
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -208,6 +213,9 @@ default_role = "member"
 max_messages_per_minute = 30
 max_joins_per_minute = 10
 require_approval = false
+# Restrict CORS to specific origins, e.g. ["https://app.example.com"]
+# Leave empty to allow any origin (suitable for LAN/desktop-app deployments)
+allowed_origins = []
 "#.to_string()
     }
 

@@ -1,10 +1,16 @@
 use axum::body::Body;
-use axum::extract::{Extension, Multipart, Path, State};
+use axum::extract::{Extension, Multipart, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+#[derive(Deserialize)]
+pub(crate) struct TokenQuery {
+    token: Option<String>,
+}
 
 use crate::auth::AuthUser;
 use crate::error::AppError;
@@ -69,7 +75,13 @@ pub async fn upload_media(
         }
     }
 
-    // Check allowed types
+    // Detect the actual file type from magic bytes — ignore client-supplied Content-Type.
+    // This prevents an attacker from uploading HTML/JS with a forged image/* MIME type.
+    let actual_mime = detect_mime_from_magic(&data);
+    mime_type = actual_mime.to_string();
+    println!("[media] Upload: detected mime from magic bytes: '{}'", mime_type);
+
+    // Check allowed types against the detected (not client-supplied) MIME
     let file_type = detect_file_type(&mime_type);
     if !state.config.media.allowed_types.contains(&file_type) {
         return Err(AppError::BadRequest(format!("File type '{}' not allowed", file_type)));
@@ -135,10 +147,25 @@ pub async fn upload_media(
 
 pub async fn download_media(
     State(state): State<AppState>,
-    Extension(auth): Extension<AuthUser>,
+    Query(query): Query<TokenQuery>,
     Path(filename): Path<String>,
+    req: Request,
 ) -> Result<Response, AppError> {
-    let username = auth.0;
+    // Accept token from Authorization: Bearer header OR ?token= query param.
+    // The ?token= fallback exists specifically for media because image/video widgets
+    // in clients cannot set custom request headers when loading a URL directly.
+    let token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+        .or(query.token)
+        .ok_or(AppError::Unauthorized("Authentication required".into()))?;
+
+    let username = crate::auth::resolve_token(&state.db, &token)
+        .ok_or(AppError::Unauthorized("Invalid token".into()))?;
+
     println!("[media] Download request for: {} by user: {}", filename, username);
 
     // Verify that user is a member of the group
@@ -182,12 +209,38 @@ pub async fn download_media(
         .first_or_octet_stream()
         .to_string();
 
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(header::CONTENT_DISPOSITION, disposition)
         .body(Body::from(data))
         .unwrap())
+}
+
+fn detect_mime_from_magic(data: &[u8]) -> &'static str {
+    match data {
+        // Images
+        d if d.starts_with(&[0xFF, 0xD8, 0xFF]) => "image/jpeg",
+        d if d.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) => "image/png",
+        d if d.starts_with(b"GIF87a") || d.starts_with(b"GIF89a") => "image/gif",
+        d if d.len() >= 12 && d.starts_with(b"RIFF") && &d[8..12] == b"WEBP" => "image/webp",
+        // Video
+        d if d.len() >= 8 && &d[4..8] == b"ftyp" => "video/mp4",
+        d if d.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) => "video/webm",
+        d if d.len() >= 12 && d.starts_with(b"RIFF") && &d[8..12] == b"AVI " => "video/x-msvideo",
+        // Audio
+        d if d.starts_with(b"ID3")
+            || (d.len() >= 2 && d[0] == 0xFF && (d[1] & 0xE0) == 0xE0) => "audio/mpeg",
+        d if d.starts_with(b"OggS") => "audio/ogg",
+        d if d.starts_with(b"fLaC") => "audio/flac",
+        d if d.len() >= 12 && d.starts_with(b"RIFF") && &d[8..12] == b"WAVE" => "audio/wav",
+        // Anything else is treated as opaque binary — not executable by browsers
+        _ => "application/octet-stream",
+    }
 }
 
 fn detect_file_type(mime: &str) -> String {

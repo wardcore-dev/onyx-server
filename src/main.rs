@@ -2,6 +2,7 @@
 
 mod auth;
 mod cli;
+mod rate_limit;
 mod config;
 mod db;
 mod error;
@@ -606,7 +607,7 @@ fn open_db_or_exit(path: &str) -> db::Db {
 
 fn print_footer() {
     println!("\n{:>78}", "© 2026 WARDCORE");
-    println!("{:>78}", "beta 0.2");
+    println!("{:>78}", "beta 0.3");
     println!();
 }
 

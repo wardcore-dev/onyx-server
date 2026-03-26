@@ -130,6 +130,14 @@ async fn send_message_inner(
     req: SendMessageRequest,
 ) -> Result<Json<Value>, AppError> {
     let username = auth.0;
+
+    if !state.msg_rate_limiter.check_and_record(&username) {
+        return Err(AppError::BadRequest(format!(
+            "Rate limit exceeded: max {} messages per minute",
+            state.config.security.max_messages_per_minute
+        )));
+    }
+
     let content = req.content.trim().to_string();
 
     if content.is_empty() {
@@ -233,6 +241,13 @@ pub async fn join_group(
     Path(invite_token): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let username = auth.0;
+
+    if !state.join_rate_limiter.check_and_record(&username) {
+        return Err(AppError::BadRequest(format!(
+            "Rate limit exceeded: max {} join attempts per minute",
+            state.config.security.max_joins_per_minute
+        )));
+    }
 
     let (group_name, display_name) = {
         let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;

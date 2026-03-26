@@ -138,31 +138,36 @@ pub async fn get_groups(
     let (info, member_count, user_role) = group_info;
 
     if let Some((id, name, is_channel, owner, invite_link, avatar_version)) = info {
-        Json(json!([{
+        let can_see_invite = matches!(user_role.as_str(), "owner" | "moderator");
+        let mut group = json!({
             "id": id,
             "name": name,
             "is_channel": is_channel,
             "owner": owner,
-            "invite_link": invite_link,
             "avatar_version": avatar_version,
             "member_count": member_count,
             "my_role": user_role,
-        }]))
+        });
+        if can_see_invite {
+            group["invite_link"] = json!(invite_link);
+        }
+        Json(json!([group]))
     } else {
         Json(json!([]))
     }
 }
 
-/// GET /group - single group info (kept for compatibility)
+/// GET /group - single group info (kept for compatibility, unauthenticated)
+/// invite_token is intentionally omitted — this endpoint is public.
 pub async fn get_group(
     State(state): State<AppState>,
 ) -> Json<Value> {
     let group_info = {
         let conn = state.db.lock().unwrap();
 
-        let info: Option<(String, String, String, i64, bool, String)> = conn
+        let info: Option<(String, String, i64, bool, String)> = conn
             .prepare(
-                "SELECT name, description, invite_token, avatar_version, is_channel, owner_username FROM group_info WHERE id = 1"
+                "SELECT name, description, avatar_version, is_channel, owner_username FROM group_info WHERE id = 1"
             )
             .ok()
             .and_then(|mut stmt| {
@@ -170,10 +175,9 @@ pub async fn get_group(
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, bool>(4)?,
-                        r.get::<_, String>(5)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, bool>(3)?,
+                        r.get::<_, String>(4)?,
                     ))
                 }).ok()
             });
@@ -187,7 +191,7 @@ pub async fn get_group(
 
     let (group_info, member_count) = group_info;
 
-    if let Some((name, description, invite_token, avatar_version, is_channel, owner)) = group_info {
+    if let Some((name, description, avatar_version, is_channel, owner)) = group_info {
         Json(json!({
             "ok": true,
             "name": name,
@@ -195,7 +199,6 @@ pub async fn get_group(
             "is_channel": is_channel,
             "owner": owner,
             "public_key": state.group_public_key,
-            "invite_token": invite_token,
             "avatar_version": avatar_version,
             "member_count": member_count,
         }))

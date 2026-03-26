@@ -67,8 +67,12 @@ pub async fn register(
             }).ok());
 
         if let Some((existing_pk, stored_pw_hash)) = existing {
-            // Verify password if one was set during registration
-            if !stored_pw_hash.is_empty() && stored_pw_hash != password_hash {
+            // Verify password if one was set during registration.
+            // Double-hash both sides so the comparison is over fixed-length digests
+            // and does not short-circuit on the first differing byte.
+            if !stored_pw_hash.is_empty()
+                && auth::hash_token(&stored_pw_hash) != auth::hash_token(&password_hash)
+            {
                 return Err(AppError::Unauthorized("Invalid password".into()));
             }
 
@@ -165,7 +169,7 @@ pub async fn register(
         }
     }
 
-    println!("[register] SUCCESS: user={}, token={}...", username, &token[..16.min(token.len())]);
+    println!("[register] SUCCESS: user={}", username);
 
     Ok(Json(json!({
         "ok": true,
@@ -200,7 +204,13 @@ pub async fn challenge(
 
     {
         let mut store = state.nonces.lock().map_err(|_| AppError::Internal("nonce lock".into()))?;
-        store.insert(username.clone(), nonce);
+        // Prune expired entries on every insert to bound memory growth
+        let now = std::time::Instant::now();
+        store.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < auth::NONCE_TTL_SECS);
+        if store.len() >= auth::NONCE_MAX_ENTRIES {
+            return Err(AppError::BadRequest("Too many pending challenges, try again later".into()));
+        }
+        store.insert(username.clone(), (nonce, now));
     }
 
     Ok(Json(json!({
@@ -218,8 +228,12 @@ pub async fn verify(
 
     let nonce = {
         let mut store = state.nonces.lock().map_err(|_| AppError::Internal("nonce lock".into()))?;
-        store.remove(&username)
-            .ok_or(AppError::BadRequest("No pending challenge for this user".into()))?
+        let (nonce_bytes, issued_at) = store.remove(&username)
+            .ok_or(AppError::BadRequest("No pending challenge for this user".into()))?;
+        if issued_at.elapsed().as_secs() >= auth::NONCE_TTL_SECS {
+            return Err(AppError::BadRequest("Challenge expired, request a new one".into()));
+        }
+        nonce_bytes
     };
 
     let public_key = {

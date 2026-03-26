@@ -11,14 +11,14 @@ pub fn print_header(text: &str) {
     let mid = format!("║ {:^76} ║", text);
     let bot = "╚══════════════════════════════════════════════════════════════════════════╝";
     println!("\n{}                    {}", top.bright_cyan(), "© 2026 WARDCORE ".bright_black());
-    println!("{}                    {}", mid.bright_cyan(), "beta 0.2".bright_black());
+    println!("{}                    {}", mid.bright_cyan(), "beta 0.3".bright_black());
     println!("{}", bot.bright_cyan());
     println!();
 }
 
 pub fn print_footer() {
     println!("\n{}", format!("{:>78}", "© 2026 WARDCORE").bright_black());
-    println!("{}", format!("{:>78}", "beta 0.2").bright_black());
+    println!("{}", format!("{:>78}", "beta 0.3").bright_black());
     println!();
 }
 

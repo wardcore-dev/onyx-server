@@ -11,11 +11,16 @@ use rand::Rng;
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::db::Db;
 use crate::server::AppState;
 
-pub type NonceStore = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+/// (nonce bytes, time issued) — entries expire after NONCE_TTL_SECS seconds
+pub type NonceStore = Arc<Mutex<HashMap<String, (Vec<u8>, Instant)>>>;
+
+pub const NONCE_TTL_SECS: u64 = 60;
+pub const NONCE_MAX_ENTRIES: usize = 10_000;
 
 pub fn new_nonce_store() -> NonceStore {
     Arc::new(Mutex::new(HashMap::new()))
@@ -98,25 +103,17 @@ pub async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    // HTTP requests must authenticate via the Authorization header only.
+    // Query-string tokens are intentionally not accepted here — they appear in
+    // proxy logs, browser history, and Referer headers.
+    // (WebSocket upgrades use ?token= separately in connection.rs because the
+    // browser WS API does not support custom request headers.)
     let token = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-        .or_else(|| {
-            req.uri()
-                .query()
-                .and_then(|q| {
-                    q.split('&')
-                        .find_map(|pair| {
-                            let mut parts = pair.splitn(2, '=');
-                            let key = parts.next()?;
-                            let val = parts.next()?;
-                            if key == "token" { Some(val.to_string()) } else { None }
-                        })
-                })
-        });
+        .map(|s| s.to_string());
 
     let token = match token {
         Some(t) => t,
@@ -132,7 +129,7 @@ pub async fn auth_middleware(
             u
         }
         None => {
-            println!("[auth] 401: token not found (token={}...)", &token[..16.min(token.len())]);
+            println!("[auth] 401: token not found");
             return Err(StatusCode::UNAUTHORIZED);
         }
     };

@@ -1,5 +1,6 @@
 use axum::{
     extract::DefaultBodyLimit,
+    http::HeaderValue,
     middleware,
     routing::{get, post, delete, patch},
     Router,
@@ -12,6 +13,7 @@ use crate::auth::{self, NonceStore};
 use crate::config::Config;
 use crate::db::Db;
 use crate::handlers::{auth_handlers, avatars, groups, info, media, members, messages};
+use crate::rate_limit::{RateLimiter, SharedRateLimiter};
 use crate::ws::connection::{ws_upgrade, ws_public_upgrade};
 use crate::ws::hub::Hub;
 
@@ -22,6 +24,8 @@ pub struct AppState {
     pub hub: Hub,
     pub nonces: NonceStore,
     pub group_public_key: String,
+    pub msg_rate_limiter: SharedRateLimiter,
+    pub join_rate_limiter: SharedRateLimiter,
 }
 
 pub async fn start(config: Config, db: Db) -> Result<(), String> {
@@ -35,7 +39,9 @@ pub async fn start(config: Config, db: Db) -> Result<(), String> {
 
     let port = config.server.port;
     let max_body_bytes = (config.media.max_file_size_mb as usize) * 1024 * 1024;
-    let state = AppState { db, config, hub, nonces, group_public_key };
+    let msg_rate_limiter = RateLimiter::new(config.security.max_messages_per_minute);
+    let join_rate_limiter = RateLimiter::new(config.security.max_joins_per_minute);
+    let state = AppState { db, config, hub, nonces, group_public_key, msg_rate_limiter, join_rate_limiter };
 
     let app = build_router(state, max_body_bytes);
 
@@ -131,7 +137,9 @@ fn build_router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/avatar", get(avatars::get_avatar))
         .route("/groups/:id/avatar", get(groups::get_group_avatar))
         .route("/ws", get(ws_upgrade))
-        .route("/ws/public/:public_token", get(ws_public_upgrade));
+        .route("/ws/public/:public_token", get(ws_public_upgrade))
+        // Media download: auth handled inside the handler (accepts Bearer or ?token=)
+        .route("/data/media/:filename", get(media::download_media));
 
     // Authenticated routes
     let auth_routes = Router::new()
@@ -155,7 +163,6 @@ fn build_router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/upload_avatar", post(avatars::upload_avatar))
         .route("/delete_avatar", delete(avatars::delete_avatar))
         .route("/data/media/upload", post(media::upload_media))  // Upload requires auth
-        .route("/data/media/:filename", get(media::download_media))  // Download requires auth + membership check
         .route("/members/:username/kick", post(members::kick_member))
         .route("/members/:username/ban", post(members::ban_member))
         .route("/members/:username/unban", post(members::unban_member))
@@ -166,10 +173,44 @@ fn build_router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/groups/:id/avatar", delete(groups::delete_group_avatar))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
 
+    let cors = build_cors_layer(&state.config);
+
     Router::new()
         .merge(public_routes)
         .merge(auth_routes)
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
+}
+
+fn build_cors_layer(config: &crate::config::Config) -> CorsLayer {
+    // Collect explicit origins from config, then fall back to public_url.
+    let mut origins: Vec<HeaderValue> = config
+        .security
+        .allowed_origins
+        .iter()
+        .filter_map(|o| o.parse::<HeaderValue>().ok())
+        .collect();
+
+    if origins.is_empty() {
+        if let Some(ref url) = config.server.public_url {
+            // Strip trailing slash and use as the sole allowed origin.
+            let origin = url.trim_end_matches('/');
+            if let Ok(hv) = origin.parse::<HeaderValue>() {
+                origins.push(hv);
+            }
+        }
+    }
+
+    if origins.is_empty() {
+        // No restriction configured — allow any origin.
+        // This is the safe default for LAN / native-app deployments where
+        // the browser same-origin policy is not the relevant threat model.
+        CorsLayer::permissive()
+    } else {
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
+    }
 }
