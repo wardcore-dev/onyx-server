@@ -107,6 +107,17 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
             UNIQUE(message_id, viewer_identifier)
         );
         CREATE INDEX IF NOT EXISTS idx_post_views_msg ON post_views(message_id);
+
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            reactor_username TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(message_id, reactor_username, emoji),
+            FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_reactions_msg ON message_reactions(message_id);
         "
 
     ).map_err(|e| format!("Failed to create tables: {}", e))?;

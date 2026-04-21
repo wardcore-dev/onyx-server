@@ -2,7 +2,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::HeaderValue,
     middleware,
-    routing::{get, post, delete, patch},
+    routing::{get, post, delete},
     Router,
 };
 use std::net::IpAddr;
@@ -146,12 +146,13 @@ fn build_router(state: AppState, max_body_bytes: usize) -> Router {
         // Group listing (client expects GET /groups returning array)
         .route("/groups", get(info::get_groups))
         // Group-prefixed routes (client uses these)
-        .route("/groups/{group_id}/history", get(messages::get_group_history))
-        .route("/groups/{group_id}/send", post(messages::send_group_message))
-        .route("/groups/join/{invite_token}", post(messages::join_group))
-        .route("/groups/{group_id}/leave", post(messages::leave_group))
-        .route("/groups/{group_id}/messages/{message_id}", delete(messages::delete_message))
-        .route("/groups/{group_id}/messages/{message_id}", patch(messages::edit_message))
+        .route("/groups/:group_id/history", get(messages::get_group_history))
+        .route("/groups/:group_id/send", post(messages::send_group_message))
+        .route("/groups/join/:invite_token", post(messages::join_group))
+        .route("/groups/:group_id/leave", post(messages::leave_group))
+        .route("/groups/:group_id/messages/:message_id", delete(messages::delete_message).patch(messages::edit_message))
+        .route("/groups/:group_id/messages/:message_id/reactions", post(messages::add_reaction))
+        .route("/groups/:group_id/messages/:message_id/reactions/:emoji", delete(messages::remove_reaction))
         // User info
         .route("/my-role", get(messages::get_my_role))
         // Legacy routes (kept for compatibility)

@@ -1,7 +1,9 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthUser;
@@ -101,6 +103,20 @@ async fn get_history_inner(
 
     let mut messages = messages;
     messages.reverse();
+
+    // Attach reactions
+    let ids: Vec<i64> = messages.iter()
+        .filter_map(|m| m.get("id").and_then(|v| v.as_i64()))
+        .collect();
+    let reactions_map = load_reactions_map(&conn, &ids);
+    drop(conn);
+    let messages: Vec<Value> = messages.into_iter().map(|mut m| {
+        if let Some(id) = m.get("id").and_then(|v| v.as_i64()) {
+            let r = reactions_map.get(&id).cloned().unwrap_or(json!({}));
+            m.as_object_mut().unwrap().insert("reactions".to_string(), r);
+        }
+        m
+    }).collect();
 
     Ok(Json(json!(messages)))
 }
@@ -379,7 +395,21 @@ pub async fn get_public_channel_history(
     let is_public_channel: bool = conn.prepare("SELECT COUNT(*) FROM group_info WHERE id = 1 AND public_channel_token = ?1 AND is_channel = 1").ok().and_then(|mut s| s.query_row([&public_token], |r| r.get::<_, i64>(0)).ok()).map(|c| c > 0).unwrap_or(false);
     if !is_public_channel { return Err(AppError::NotFound("Public channel not found".into())); }
     let messages: Vec<Value> = if let Some(before_id) = query.before_id { let mut stmt = conn.prepare("SELECT id, sender_username, content, reply_to_id, reply_to_sender, reply_to_content, timestamp, timestamp_ms FROM messages WHERE id < ?1 ORDER BY id DESC LIMIT ?2")?; let rows = stmt.query_map(rusqlite::params![before_id, limit], |row| Ok(json!({ "id": row.get::<_, i64>(0)?, "sender": row.get::<_, String>(1)?, "content": row.get::<_, String>(2)?, "reply_to_id": row.get::<_, Option<i64>>(3)?, "reply_to_sender": row.get::<_, Option<String>>(4)?, "reply_to_content": row.get::<_, Option<String>>(5)?, "timestamp": row.get::<_, String>(6)?, "timestamp_ms": row.get::<_, i64>(7)? })))?; rows.filter_map(|r| r.ok()).collect() } else { let mut stmt = conn.prepare("SELECT id, sender_username, content, reply_to_id, reply_to_sender, reply_to_content, timestamp, timestamp_ms FROM messages ORDER BY id DESC LIMIT ?1")?; let rows = stmt.query_map([limit], |row| Ok(json!({ "id": row.get::<_, i64>(0)?, "sender": row.get::<_, String>(1)?, "content": row.get::<_, String>(2)?, "reply_to_id": row.get::<_, Option<i64>>(3)?, "reply_to_sender": row.get::<_, Option<String>>(4)?, "reply_to_content": row.get::<_, Option<String>>(5)?, "timestamp": row.get::<_, String>(6)?, "timestamp_ms": row.get::<_, i64>(7)? })))?; rows.filter_map(|r| r.ok()).collect() };
-    let mut messages = messages; messages.reverse(); Ok(Json(json!(messages)))
+    let mut messages = messages;
+    messages.reverse();
+    let ids: Vec<i64> = messages.iter()
+        .filter_map(|m| m.get("id").and_then(|v| v.as_i64()))
+        .collect();
+    let reactions_map = load_reactions_map(&conn, &ids);
+    drop(conn);
+    let messages: Vec<Value> = messages.into_iter().map(|mut m| {
+        if let Some(id) = m.get("id").and_then(|v| v.as_i64()) {
+            let r = reactions_map.get(&id).cloned().unwrap_or(json!({}));
+            m.as_object_mut().unwrap().insert("reactions".to_string(), r);
+        }
+        m
+    }).collect();
+    Ok(Json(json!(messages)))
 }
 
 /// GET /my-role - Get current user's role
@@ -440,6 +470,179 @@ pub async fn delete_message(
     state.hub.broadcast_to_all_subscribed(&packet).await;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+// ─── Reactions ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AddReactionRequest {
+    pub emoji: String,
+}
+
+fn is_valid_emoji(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed.len() > 32 {
+        return false;
+    }
+    trimmed.chars().any(|c| c as u32 > 127)
+}
+
+/// Load aggregated reactions for a list of message IDs.
+/// Returns { emoji -> [username, ...] } per message_id.
+pub fn load_reactions_map(
+    conn: &Connection,
+    message_ids: &[i64],
+) -> HashMap<i64, Value> {
+    if message_ids.is_empty() {
+        return HashMap::new();
+    }
+    let placeholders: String = message_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT message_id, emoji, reactor_username FROM message_reactions WHERE message_id IN ({}) ORDER BY message_id, emoji, created_at",
+        placeholders
+    );
+    let mut map: HashMap<i64, HashMap<String, Vec<String>>> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                map.entry(row.0)
+                    .or_default()
+                    .entry(row.1)
+                    .or_default()
+                    .push(row.2);
+            }
+        }
+    }
+    map.into_iter()
+        .map(|(id, emoji_map)| {
+            let v: serde_json::Map<String, Value> = emoji_map
+                .into_iter()
+                .map(|(emoji, users)| (emoji, Value::Array(users.into_iter().map(Value::String).collect())))
+                .collect();
+            (id, Value::Object(v))
+        })
+        .collect()
+}
+
+/// POST /groups/{group_id}/messages/{message_id}/reactions
+pub async fn add_reaction(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Path((_group_id, message_id)): Path<(i64, i64)>,
+    Json(req): Json<AddReactionRequest>,
+) -> Result<Json<Value>, AppError> {
+    let username = auth.0;
+    let emoji = req.emoji.trim().to_string();
+
+    if !is_valid_emoji(&emoji) {
+        return Err(AppError::BadRequest("Invalid emoji".into()));
+    }
+
+    let reactions = {
+        let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
+
+        let is_member: bool = conn
+            .prepare("SELECT COUNT(*) FROM members WHERE username = ?1")?
+            .query_row([&username], |r| r.get::<_, i64>(0))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !is_member {
+            return Err(AppError::Forbidden("Not a member".into()));
+        }
+
+        let msg_exists: bool = conn
+            .prepare("SELECT COUNT(*) FROM messages WHERE id = ?1")?
+            .query_row([message_id], |r| r.get::<_, i64>(0))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !msg_exists {
+            return Err(AppError::NotFound("Message not found".into()));
+        }
+
+        conn.execute(
+            "INSERT OR IGNORE INTO message_reactions (message_id, reactor_username, emoji) VALUES (?1, ?2, ?3)",
+            rusqlite::params![message_id, username, emoji],
+        )?;
+
+        let map = load_reactions_map(&conn, &[message_id]);
+        map.get(&message_id).cloned().unwrap_or(json!({}))
+    };
+
+    let packet = json!({
+        "type": "reaction_update",
+        "group_id": 1,
+        "message_id": message_id,
+        "reactions": reactions,
+        "actor": username,
+        "emoji": emoji,
+        "action": "add",
+    });
+    state.hub.broadcast_to_all_subscribed(&packet).await;
+
+    Ok(Json(json!({ "ok": true, "reactions": reactions })))
+}
+
+/// DELETE /groups/{group_id}/messages/{message_id}/reactions/{emoji}
+pub async fn remove_reaction(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthUser>,
+    Path((_group_id, message_id, emoji_raw)): Path<(i64, i64, String)>,
+) -> Result<Json<Value>, AppError> {
+    let username = auth.0;
+    let emoji = emoji_raw.trim().to_string();
+
+    if !is_valid_emoji(&emoji) {
+        return Err(AppError::BadRequest("Invalid emoji".into()));
+    }
+
+    let reactions = {
+        let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
+
+        let is_member: bool = conn
+            .prepare("SELECT COUNT(*) FROM members WHERE username = ?1")?
+            .query_row([&username], |r| r.get::<_, i64>(0))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !is_member {
+            return Err(AppError::Forbidden("Not a member".into()));
+        }
+
+        conn.execute(
+            "DELETE FROM message_reactions WHERE message_id = ?1 AND reactor_username = ?2 AND emoji = ?3",
+            rusqlite::params![message_id, username, emoji],
+        )?;
+
+        let map = load_reactions_map(&conn, &[message_id]);
+        map.get(&message_id).cloned().unwrap_or(json!({}))
+    };
+
+    let packet = json!({
+        "type": "reaction_update",
+        "group_id": 1,
+        "message_id": message_id,
+        "reactions": reactions,
+        "actor": username,
+        "emoji": emoji,
+        "action": "remove",
+    });
+    state.hub.broadcast_to_all_subscribed(&packet).await;
+
+    Ok(Json(json!({ "ok": true, "reactions": reactions })))
 }
 
 /// PATCH /groups/{group_id}/messages/{message_id} - Edit own message
