@@ -11,6 +11,7 @@ mod instance_config;
 mod media;
 mod models;
 mod moderation;
+mod permissions;
 mod pm;
 mod server;
 mod updater;

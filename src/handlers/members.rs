@@ -1,20 +1,22 @@
 use axum::extract::{Extension, Path, State};
 use axum::Json;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::models::ban::BanRequest;
-use crate::models::member::Role;
+use crate::models::permission::Permission;
+use crate::permissions::{count_owner_equivalent_members, has_any_permission, has_permission, is_owner_equivalent};
 use crate::server::AppState;
 
-/// Get a member's role from the single-group members table
-fn get_member_role(conn: &rusqlite::Connection, username: &str) -> Result<Role, AppError> {
-    let role_str: String = conn
-        .prepare("SELECT role FROM members WHERE username = ?1")?
-        .query_row(rusqlite::params![username], |r| r.get(0))
-        .map_err(|_| AppError::NotFound("Not a member of this group".into()))?;
-    Role::from_str(&role_str).ok_or(AppError::Internal("Invalid role in database".into()))
+/// True if the target's membership row exists at all (used to give a clean 404
+/// rather than an opaque permission failure for a non-member target).
+fn is_member(conn: &rusqlite::Connection, username: &str) -> Result<bool, AppError> {
+    conn.prepare("SELECT COUNT(*) FROM members WHERE username = ?1")?
+        .query_row(rusqlite::params![username], |r| r.get::<_, i64>(0))
+        .map(|c| c > 0)
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 pub async fn check_ban_status(
@@ -50,19 +52,35 @@ pub async fn list_members(
     let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
 
     // Check membership
-    let _role = get_member_role(&conn, &username)?;
+    if !is_member(&conn, &username)? {
+        return Err(AppError::NotFound("Not a member of this group".into()));
+    }
 
     let mut stmt = conn.prepare(
-        "SELECT username, display_name, role, joined_at FROM members ORDER BY joined_at"
+        "SELECT m.username, m.display_name, m.role, m.joined_at, m.role_id, r.name, r.color, mu.expires_at
+         FROM members m LEFT JOIN roles r ON r.id = m.role_id
+         LEFT JOIN mutes mu ON mu.username = m.username
+         ORDER BY m.joined_at"
     )?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
     let members: Vec<Value> = stmt
         .query_map([], |row| {
+            let expires_at: Option<i64> = row.get(7)?;
+            let is_muted = expires_at.is_some_and(|e| e > now);
             Ok(json!({
                 "username": row.get::<_, String>(0)?,
                 "display_name": row.get::<_, String>(1)?,
                 "role": row.get::<_, String>(2)?,
                 "joined_at": row.get::<_, String>(3)?,
+                "role_id": row.get::<_, Option<i64>>(4)?,
+                "role_name": row.get::<_, Option<String>>(5)?,
+                "role_color": row.get::<_, Option<String>>(6)?,
+                "is_muted": is_muted,
             }))
         })?
         .filter_map(|r| r.ok())
@@ -83,17 +101,18 @@ pub async fn kick_member(
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let conn = db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
 
-        let my_role = get_member_role(&conn, &username)?;
-        if !my_role.can_moderate() {
+        if !has_permission(&conn, &username, Permission::KICK_MEMBERS)? {
             return Err(AppError::Forbidden("Insufficient permissions".into()));
         }
 
-        let target_role = get_member_role(&conn, &target)?;
-        if target_role.is_owner() {
-            return Err(AppError::Forbidden("Cannot kick the owner".into()));
+        if !is_member(&conn, &target)? {
+            return Err(AppError::NotFound("Not a member of this group".into()));
         }
-        if target_role.can_moderate() && !my_role.is_owner() {
-            return Err(AppError::Forbidden("Only the owner can kick moderators".into()));
+
+        // A target holding the system Owner role can only be kicked by another
+        // Owner-equivalent member — generalizes the old "can't kick the owner" rule.
+        if is_owner_equivalent(&conn, &target)? && !is_owner_equivalent(&conn, &username)? {
+            return Err(AppError::Forbidden("Cannot kick an owner".into()));
         }
 
         conn.execute(
@@ -136,18 +155,12 @@ pub async fn ban_member(
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let conn = db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
 
-        let my_role = get_member_role(&conn, &username)?;
-        if !my_role.can_moderate() {
+        if !has_any_permission(&conn, &username, &[Permission::BAN_MEMBERS, Permission::VIEW_BAN_LIST])? {
             return Err(AppError::Forbidden("Insufficient permissions".into()));
         }
 
-        if let Ok(target_role) = get_member_role(&conn, &target) {
-            if target_role.is_owner() {
-                return Err(AppError::Forbidden("Cannot ban the owner".into()));
-            }
-            if target_role.can_moderate() && !my_role.is_owner() {
-                return Err(AppError::Forbidden("Only the owner can ban moderators".into()));
-            }
+        if is_member(&conn, &target)? && is_owner_equivalent(&conn, &target)? && !is_owner_equivalent(&conn, &username)? {
+            return Err(AppError::Forbidden("Cannot ban an owner".into()));
         }
 
         conn.execute(
@@ -195,8 +208,7 @@ pub async fn unban_member(
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let conn = db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
 
-        let my_role = get_member_role(&conn, &username)?;
-        if !my_role.can_moderate() {
+        if !has_any_permission(&conn, &username, &[Permission::BAN_MEMBERS, Permission::VIEW_BAN_LIST])? {
             return Err(AppError::Forbidden("Insufficient permissions".into()));
         }
 
@@ -216,7 +228,7 @@ pub async fn unban_member(
         // Re-add user to members with default role
         if let Ok((display_name, public_key)) = user_info {
             conn.execute(
-                "INSERT OR REPLACE INTO members (username, display_name, public_key, role) VALUES (?1, ?2, ?3, 'member')",
+                "INSERT OR REPLACE INTO members (username, display_name, public_key, role, role_id) VALUES (?1, ?2, ?3, 'member', 3)",
                 rusqlite::params![target, display_name, public_key],
             )?;
         }
@@ -241,9 +253,7 @@ pub async fn list_bans(
     let username = auth.0;
     let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
 
-    // Only moderators and owners can view the ban list
-    let my_role = get_member_role(&conn, &username)?;
-    if !my_role.can_moderate() {
+    if !has_permission(&conn, &username, Permission::VIEW_BAN_LIST)? {
         return Err(AppError::Forbidden("Insufficient permissions".into()));
     }
 
@@ -266,78 +276,88 @@ pub async fn list_bans(
     Ok(Json(json!(bans)))
 }
 
+#[derive(Deserialize)]
+pub struct SetRoleRequest {
+    pub role_id: i64,
+}
+
 pub async fn set_role(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthUser>,
     Path(target_username): Path<String>,
-    Json(body): Json<Value>,
+    Json(body): Json<SetRoleRequest>,
 ) -> Result<Json<Value>, AppError> {
     let username = auth.0.clone();
     let target = target_username.clone();
-    let new_role_str = body["role"].as_str()
-        .ok_or(AppError::BadRequest("role required".into()))?;
-    let new_role = Role::from_str(new_role_str)
-        .ok_or(AppError::BadRequest("role must be: owner, moderator, or member".into()))?;
-
-    // Save the role string for later use
-    let role_str = new_role.as_str().to_string();
+    let new_role_id = body.role_id;
     let db = state.db.clone();
 
-    // Perform database operations in a blocking task
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+    let (role_name, role_color, role_permissions) = tokio::task::spawn_blocking(move || -> Result<(String, String, i64), AppError> {
         let conn = db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
 
-        let my_role = get_member_role(&conn, &username)?;
-        if !my_role.is_owner() {
-            return Err(AppError::Forbidden("Only owners can change roles".into()));
+        if !has_permission(&conn, &username, Permission::MANAGE_ROLES)? {
+            return Err(AppError::Forbidden("Insufficient permissions".into()));
         }
 
-        // Get current role of target user
-        let target_current_role = get_member_role(&conn, &target)?;
+        let (role_name, role_color, role_permissions): (String, String, i64) = conn
+            .prepare("SELECT name, color, permissions FROM roles WHERE id = ?1")?
+            .query_row(rusqlite::params![new_role_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|_| AppError::BadRequest("Unknown role_id".into()))?;
 
-        // If promoting to owner, check we don't exceed 3 owners
-        if new_role.is_owner() && !target_current_role.is_owner() {
-            let owner_count: i64 = conn
-                .prepare("SELECT COUNT(*) FROM members WHERE role = 'owner'")?
-                .query_row([], |r| r.get(0))
-                .unwrap_or(0);
-
-            if owner_count >= 3 {
-                return Err(AppError::BadRequest("Maximum 3 owners allowed".into()));
-            }
+        if !is_member(&conn, &target)? {
+            return Err(AppError::NotFound("User is not a member of this group".into()));
         }
 
-        // If demoting an owner, ensure at least 1 owner remains
-        if target_current_role.is_owner() && !new_role.is_owner() {
-            let owner_count: i64 = conn
-                .prepare("SELECT COUNT(*) FROM members WHERE role = 'owner'")?
-                .query_row([], |r| r.get(0))
-                .unwrap_or(0);
+        // Promoting to the system Owner role requires the caller to already be an Owner.
+        if new_role_id == 1 && !is_owner_equivalent(&conn, &username)? {
+            return Err(AppError::Forbidden("Only owners can promote a member to Owner".into()));
+        }
 
-            if owner_count <= 1 {
+        // Demoting an existing Owner away from role_id=1 must always leave at least one Owner.
+        if is_owner_equivalent(&conn, &target)? && new_role_id != 1 {
+            if count_owner_equivalent_members(&conn)? <= 1 {
                 return Err(AppError::BadRequest("Cannot demote the last owner".into()));
             }
         }
 
         let updated = conn.execute(
-            "UPDATE members SET role = ?1 WHERE username = ?2",
-            rusqlite::params![new_role.as_str(), target],
+            "UPDATE members SET role_id = ?1, role = ?2 WHERE username = ?3",
+            rusqlite::params![new_role_id, role_name.to_lowercase(), target],
         )?;
 
         if updated == 0 {
             return Err(AppError::NotFound("User is not a member of this group".into()));
         }
 
-        Ok(())
+        Ok((role_name, role_color, role_permissions))
     }).await.map_err(|_| AppError::Internal("DB task failed".into()))??;
 
     // Send role_changed event to the user whose role was changed
     let packet_role_changed = json!({
         "type": "role_changed",
         "group_id": 1,
-        "role": &role_str,
+        "role_id": new_role_id,
+        "role_name": &role_name,
+        "role_color": &role_color,
+        "permissions": Permission::from_bits_truncate(role_permissions).to_names(),
     });
     state.hub.send_to_user(&target_username, &packet_role_changed).await;
 
-    Ok(Json(json!({ "ok": true, "role": role_str })))
+    // Also broadcast a lightweight group-wide notice so every connected
+    // client can keep its username->role-color map (used for chat nickname
+    // coloring) fresh without having to reload the member list.
+    let packet_member_role_updated = json!({
+        "type": "member_role_updated",
+        "username": &target_username,
+        "role_name": &role_name,
+        "role_color": &role_color,
+    });
+    state.hub.broadcast_to_all_subscribed(&packet_member_role_updated).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "role_id": new_role_id,
+        "role_name": role_name,
+        "role_color": role_color,
+    })))
 }

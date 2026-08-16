@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 
 use crate::auth::AuthUser;
 use crate::error::AppError;
+use crate::permissions::has_permission;
+use crate::models::permission::Permission;
 use crate::server::AppState;
 
 /// GET /info - client expects "name" field for server name
@@ -57,6 +59,7 @@ pub async fn get_info(
     if state.config.voice.enabled {
         features.push("voice");
     }
+    features.push("custom_roles");
 
     if let Some((group_name, description, _invite_token, _avatar_version, is_channel, public_token)) = group_info {
         let vc = &state.config.voice;
@@ -112,9 +115,9 @@ pub async fn get_groups(
     let group_info = {
         let conn = state.db.lock().unwrap();
 
-        let info: Option<(i64, String, bool, String, String, i64)> = conn
+        let info: Option<(i64, String, bool, String, String, i64, i64)> = conn
             .prepare(
-                "SELECT id, name, is_channel, owner_username, invite_token, avatar_version FROM group_info WHERE id = 1"
+                "SELECT id, name, is_channel, owner_username, invite_token, avatar_version, slow_mode_seconds FROM group_info WHERE id = 1"
             )
             .ok()
             .and_then(|mut stmt| {
@@ -126,6 +129,7 @@ pub async fn get_groups(
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
                         r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
                     ))
                 }).ok()
             });
@@ -141,13 +145,26 @@ pub async fn get_groups(
             .and_then(|mut stmt| stmt.query_row([&username], |r| r.get(0)).ok())
             .unwrap_or_else(|| "member".to_string());
 
-        (info, member_count, user_role)
+        let can_see_invite = has_permission(&conn, &username, Permission::VIEW_INVITE_LINK).unwrap_or(false);
+
+        let permissions_bits: Option<i64> = conn
+            .query_row(
+                "SELECT r.permissions FROM members m JOIN roles r ON r.id = m.role_id WHERE m.username = ?1",
+                [&username],
+                |r| r.get(0),
+            )
+            .ok();
+        let my_permissions = permissions_bits
+            .map(Permission::from_bits_truncate)
+            .unwrap_or(Permission::empty())
+            .to_names();
+
+        (info, member_count, user_role, can_see_invite, my_permissions)
     };
 
-    let (info, member_count, user_role) = group_info;
+    let (info, member_count, user_role, can_see_invite, my_permissions) = group_info;
 
-    if let Some((id, name, is_channel, owner, invite_link, avatar_version)) = info {
-        let can_see_invite = matches!(user_role.as_str(), "owner" | "moderator");
+    if let Some((id, name, is_channel, owner, invite_link, avatar_version, slow_mode_seconds)) = info {
         let mut group = json!({
             "id": id,
             "name": name,
@@ -156,6 +173,8 @@ pub async fn get_groups(
             "avatar_version": avatar_version,
             "member_count": member_count,
             "my_role": user_role,
+            "my_permissions": my_permissions,
+            "slow_mode_seconds": slow_mode_seconds,
         });
         if can_see_invite {
             group["invite_link"] = json!(invite_link);
@@ -174,9 +193,9 @@ pub async fn get_group(
     let group_info = {
         let conn = state.db.lock().unwrap();
 
-        let info: Option<(String, String, i64, bool, String)> = conn
+        let info: Option<(String, String, i64, bool, String, i64)> = conn
             .prepare(
-                "SELECT name, description, avatar_version, is_channel, owner_username FROM group_info WHERE id = 1"
+                "SELECT name, description, avatar_version, is_channel, owner_username, slow_mode_seconds FROM group_info WHERE id = 1"
             )
             .ok()
             .and_then(|mut stmt| {
@@ -187,6 +206,7 @@ pub async fn get_group(
                         r.get::<_, i64>(2)?,
                         r.get::<_, bool>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
                     ))
                 }).ok()
             });
@@ -200,7 +220,7 @@ pub async fn get_group(
 
     let (group_info, member_count) = group_info;
 
-    if let Some((name, description, avatar_version, is_channel, owner)) = group_info {
+    if let Some((name, description, avatar_version, is_channel, owner, slow_mode_seconds)) = group_info {
         Json(json!({
             "ok": true,
             "name": name,
@@ -210,6 +230,7 @@ pub async fn get_group(
             "public_key": state.group_public_key,
             "avatar_version": avatar_version,
             "member_count": member_count,
+            "slow_mode_seconds": slow_mode_seconds,
         }))
     } else {
         Json(json!({

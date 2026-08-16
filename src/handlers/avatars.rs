@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 
 use crate::auth::AuthUser;
 use crate::error::AppError;
+use crate::models::permission::Permission;
+use crate::permissions::has_permission;
 use crate::server::AppState;
 
 pub async fn upload_avatar(
@@ -18,13 +20,8 @@ pub async fn upload_avatar(
 
     {
         let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
-        let role: String = conn
-            .prepare("SELECT role FROM members WHERE username = ?1")?
-            .query_row([&username], |r| r.get(0))
-            .map_err(|_| AppError::NotFound("Not a member".into()))?;
-
-        if role != "owner" && role != "moderator" {
-            return Err(AppError::Forbidden("Only owner or moderator can change avatar".into()));
+        if !has_permission(&conn, &username, Permission::MANAGE_SETTINGS)? {
+            return Err(AppError::Forbidden("Insufficient permissions to change avatar".into()));
         }
     }
 
@@ -103,13 +100,8 @@ pub async fn delete_avatar(
 
     {
         let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
-        let owner: String = conn
-            .prepare("SELECT owner_username FROM group_info WHERE id = 1")?
-            .query_row([], |r| r.get(0))
-            .map_err(|_| AppError::NotFound("Group not found".into()))?;
-
-        if owner != username {
-            return Err(AppError::Forbidden("Only owner can delete avatar".into()));
+        if !has_permission(&conn, &username, Permission::MANAGE_SETTINGS)? {
+            return Err(AppError::Forbidden("Insufficient permissions to delete avatar".into()));
         }
 
         conn.execute("DELETE FROM group_avatar WHERE id = 1", [])?;

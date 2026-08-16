@@ -1159,6 +1159,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64",
+ "bitflags",
  "chrono",
  "clap",
  "colored",

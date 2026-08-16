@@ -2,7 +2,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::HeaderValue,
     middleware,
-    routing::{get, post, delete},
+    routing::{get, post, delete, put},
     Router,
 };
 use std::net::IpAddr;
@@ -12,8 +12,8 @@ use tracing::info;
 use crate::auth::{self, NonceStore};
 use crate::config::Config;
 use crate::db::Db;
-use crate::handlers::{auth_handlers, avatars, groups, info, media, members, messages, voice};
-use crate::rate_limit::{RateLimiter, SharedRateLimiter};
+use crate::handlers::{auth_handlers, avatars, comments, donations, group_settings, groups, info, media, members, messages, moderation_handlers, polls, roles, voice};
+use crate::rate_limit::{RateLimiter, SharedRateLimiter, SlowModeTracker, SharedSlowModeTracker};
 use crate::ws::connection::{ws_upgrade, ws_public_upgrade};
 use crate::ws::hub::Hub;
 
@@ -26,6 +26,7 @@ pub struct AppState {
     pub group_public_key: String,
     pub msg_rate_limiter: SharedRateLimiter,
     pub join_rate_limiter: SharedRateLimiter,
+    pub slow_mode_tracker: SharedSlowModeTracker,
 }
 
 pub async fn start(config: Config, db: Db) -> Result<(), String> {
@@ -41,7 +42,8 @@ pub async fn start(config: Config, db: Db) -> Result<(), String> {
     let max_body_bytes = (config.media.max_file_size_mb as usize) * 1024 * 1024;
     let msg_rate_limiter = RateLimiter::new(config.security.max_messages_per_minute);
     let join_rate_limiter = RateLimiter::new(config.security.max_joins_per_minute);
-    let state = AppState { db, config, hub, nonces, group_public_key, msg_rate_limiter, join_rate_limiter };
+    let slow_mode_tracker = SlowModeTracker::new();
+    let state = AppState { db, config, hub, nonces, group_public_key, msg_rate_limiter, join_rate_limiter, slow_mode_tracker };
 
     let app = build_router(state, max_body_bytes);
 
@@ -173,6 +175,27 @@ fn build_router(state: AppState, max_body_bytes: usize) -> Router {
         .route("/groups/:id/rename", post(groups::rename_group))
         .route("/groups/:id/avatar", post(groups::upload_group_avatar))
         .route("/groups/:id/avatar", delete(groups::delete_group_avatar))
+        // Moderation: mute / slow mode
+        .route("/members/:username/mute", post(moderation_handlers::mute_member))
+        .route("/members/:username/unmute", post(moderation_handlers::unmute_member))
+        .route("/mutes", get(moderation_handlers::list_mutes))
+        .route("/groups/:id/slow-mode", post(moderation_handlers::set_slow_mode))
+        // Donations
+        .route("/donations", get(donations::get_donations).put(donations::set_donations))
+        // Polls
+        .route("/polls", get(polls::list_polls).post(polls::create_poll))
+        .route("/polls/:id", get(polls::get_poll))
+        .route("/polls/:id/vote", post(polls::vote_poll))
+        // Custom roles
+        .route("/roles", get(roles::list_roles).post(roles::create_role))
+        .route("/roles/:id", put(roles::update_role).delete(roles::delete_role))
+        // Group settings
+        .route("/groups/:id/settings", get(group_settings::get_settings).put(group_settings::update_settings))
+        // Channel post comments
+        .route("/messages/:id/comments", get(comments::list_comments).post(comments::create_comment))
+        .route("/comments/:id", delete(comments::delete_comment).patch(comments::edit_comment))
+        .route("/comments/:id/reactions", post(comments::add_comment_reaction))
+        .route("/comments/:id/reactions/:emoji", delete(comments::remove_comment_reaction))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
 
     let cors = build_cors_layer(&state.config);

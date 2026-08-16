@@ -3,3 +3,4 @@ pub mod member;
 pub mod message;
 pub mod ban;
 pub mod session;
+pub mod permission;

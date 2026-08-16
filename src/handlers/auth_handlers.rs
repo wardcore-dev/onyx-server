@@ -21,7 +21,13 @@ pub async fn register(
     if username.is_empty() || public_key.is_empty() {
         return Err(AppError::BadRequest("username and public_key required".into()));
     }
-    // Password is optional (required for groups, optional for channels)
+    // Password is mandatory for every registration — groups AND channels.
+    // Without this, anyone could "join" under an existing member's (e.g. a
+    // moderator's) username with a fresh keypair and silently inherit their
+    // role, since nothing else binds the username to a specific person.
+    if password_hash.is_empty() {
+        return Err(AppError::BadRequest("password is required".into()));
+    }
     if username.len() > 64 || display_name.len() > 128 {
         return Err(AppError::BadRequest("username or display_name too long".into()));
     }
@@ -66,22 +72,33 @@ pub async fn register(
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             }).ok());
 
-        if let Some((existing_pk, stored_pw_hash)) = existing {
-            // Verify password if one was set during registration.
-            // Double-hash both sides so the comparison is over fixed-length digests
-            // and does not short-circuit on the first differing byte.
-            if !stored_pw_hash.is_empty()
-                && auth::hash_token(&stored_pw_hash) != auth::hash_token(&password_hash)
-            {
-                return Err(AppError::Unauthorized("Invalid password".into()));
-            }
+        if let Some((_existing_pk, stored_pw_hash)) = existing {
+            if stored_pw_hash.is_empty() {
+                // Legacy account created before passwords were mandatory for
+                // channels — adopt the password now being supplied instead of
+                // leaving the username permanently unauthenticated. This is a
+                // one-time migration: after this call the account behaves
+                // like any password-protected one below.
+                println!("[register] {} had no password on file — adopting the one supplied now", username);
+                conn.execute(
+                    "UPDATE sessions SET display_name = ?1, public_key = ?2, password_hash = ?3, last_seen = datetime('now') WHERE username = ?4",
+                    rusqlite::params![display_name, public_key, password_hash, username],
+                )?;
+            } else {
+                // Verify password. Double-hash both sides so the comparison is
+                // over fixed-length digests and does not short-circuit on the
+                // first differing byte.
+                if auth::hash_token(&stored_pw_hash) != auth::hash_token(&password_hash) {
+                    return Err(AppError::Unauthorized("Invalid password".into()));
+                }
 
-            // Password is correct — update identity fields but NOT the token in sessions.
-            // The new token is stored in device_tokens to support multiple devices.
-            conn.execute(
-                "UPDATE sessions SET display_name = ?1, public_key = ?2, last_seen = datetime('now') WHERE username = ?3",
-                rusqlite::params![display_name, public_key, username],
-            )?;
+                // Password is correct — update identity fields but NOT the token in sessions.
+                // The new token is stored in device_tokens to support multiple devices.
+                conn.execute(
+                    "UPDATE sessions SET display_name = ?1, public_key = ?2, last_seen = datetime('now') WHERE username = ?3",
+                    rusqlite::params![display_name, public_key, username],
+                )?;
+            }
             conn.execute(
                 "INSERT OR IGNORE INTO device_tokens (username, token) VALUES (?1, ?2)",
                 rusqlite::params![username, token_hash],
@@ -114,24 +131,30 @@ pub async fn register(
                         .prepare("SELECT COUNT(*) FROM members")?
                         .query_row([], |r| r.get(0))?;
 
-                    // First user gets owner role, others get default role
-                    let role = if member_count == 0 { "owner" } else { &state.config.moderation.default_role };
-
-                    conn.execute(
-                        "INSERT INTO members (username, display_name, public_key, role) VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![username, display_name, public_key, role],
-                    )?;
-
-                    // If this is the first user (owner), update group_info owner_username
                     if member_count == 0 {
+                        conn.execute(
+                            "INSERT INTO members (username, display_name, public_key, role, role_id) VALUES (?1, ?2, ?3, 'owner', 1)",
+                            rusqlite::params![username, display_name, public_key],
+                        )?;
                         conn.execute(
                             "UPDATE group_info SET owner_username = ?1 WHERE id = 1",
                             [&username],
                         )?;
                         println!("[register] Set {} as group owner", username);
-                    }
+                    } else {
+                        let default_role_id: i64 = conn
+                            .query_row("SELECT default_role_id FROM group_info WHERE id = 1", [], |r| r.get(0))
+                            .unwrap_or(3);
+                        let default_role_name: String = conn
+                            .query_row("SELECT name FROM roles WHERE id = ?1", [default_role_id], |r| r.get(0))
+                            .unwrap_or_else(|_| "member".to_string());
 
-                    println!("[register] Added user {} to members with role {}", username, role);
+                        conn.execute(
+                            "INSERT INTO members (username, display_name, public_key, role, role_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![username, display_name, public_key, default_role_name.to_lowercase(), default_role_id],
+                        )?;
+                        println!("[register] Added user {} to members with role {}", username, default_role_name);
+                    }
                 }
             }
         } else {
@@ -160,10 +183,31 @@ pub async fn register(
                     .unwrap_or(false);
 
                 if group_exists {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO members (username, display_name, public_key, role) VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![username, display_name, public_key, state.config.moderation.default_role],
-                    )?;
+                    let member_count: i64 = conn
+                        .prepare("SELECT COUNT(*) FROM members")?
+                        .query_row([], |r| r.get(0))?;
+                    if member_count == 0 {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO members (username, display_name, public_key, role, role_id) VALUES (?1, ?2, ?3, 'owner', 1)",
+                            rusqlite::params![username, display_name, public_key],
+                        )?;
+                        conn.execute(
+                            "UPDATE group_info SET owner_username = ?1 WHERE id = 1",
+                            [&username],
+                        )?;
+                    } else {
+                        let default_role_id: i64 = conn
+                            .query_row("SELECT default_role_id FROM group_info WHERE id = 1", [], |r| r.get(0))
+                            .unwrap_or(3);
+                        let default_role_name: String = conn
+                            .query_row("SELECT name FROM roles WHERE id = ?1", [default_role_id], |r| r.get(0))
+                            .unwrap_or_else(|_| "member".to_string());
+
+                        conn.execute(
+                            "INSERT OR IGNORE INTO members (username, display_name, public_key, role, role_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![username, display_name, public_key, default_role_name.to_lowercase(), default_role_id],
+                        )?;
+                    }
                 }
             }
         }

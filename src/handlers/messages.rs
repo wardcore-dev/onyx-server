@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::auth::AuthUser;
 use crate::error::AppError;
 use crate::models::message::SendMessageRequest;
+use crate::models::permission::Permission;
+use crate::permissions::{count_owner_equivalent_members, has_permission, is_owner_equivalent};
 use crate::server::AppState;
 
 #[derive(Deserialize)]
@@ -104,16 +106,28 @@ async fn get_history_inner(
     let mut messages = messages;
     messages.reverse();
 
-    // Attach reactions
+    // Attach reactions and comment counts
     let ids: Vec<i64> = messages.iter()
         .filter_map(|m| m.get("id").and_then(|v| v.as_i64()))
         .collect();
-    let reactions_map = load_reactions_map(&conn, &ids);
+    let reactions_map = load_reactions_map(&conn, &ids, Some(username.as_str()));
+    let comment_previews = crate::handlers::comments::load_comment_previews(&conn, &ids);
     drop(conn);
     let messages: Vec<Value> = messages.into_iter().map(|mut m| {
         if let Some(id) = m.get("id").and_then(|v| v.as_i64()) {
             let r = reactions_map.get(&id).cloned().unwrap_or(json!({}));
-            m.as_object_mut().unwrap().insert("reactions".to_string(), r);
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("reactions".to_string(), r);
+            match comment_previews.get(&id) {
+                Some(p) => {
+                    obj.insert("comment_count".to_string(), json!(p.count));
+                    obj.insert("last_comment_sender".to_string(), json!(p.last_sender));
+                    obj.insert("last_comment_content".to_string(), json!(p.last_content));
+                }
+                None => {
+                    obj.insert("comment_count".to_string(), json!(0));
+                }
+            }
         }
         m
     }).collect();
@@ -173,16 +187,34 @@ async fn send_message_inner(
             .query_row([&username], |r| r.get::<_, i64>(0))
             .map(|c| c > 0)
             .unwrap_or(false);
-
         if !is_member {
             return Err(AppError::Forbidden("Not a member of this group".into()));
         }
 
+        if let Some(expires_at) = crate::handlers::moderation_handlers::active_mute_expiry(&conn, &username) {
+            return Err(AppError::Forbidden(format!("You are muted until {}", expires_at)));
+        }
+
         // Check if this is a channel - channels post messages from channel name, not user
-        let (is_channel, channel_name): (bool, String) = conn
-            .prepare("SELECT is_channel, name FROM group_info WHERE id = 1")?
-            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((false, String::new()));
+        let (is_channel, channel_name, slow_mode_seconds): (bool, String, i64) = conn
+            .prepare("SELECT is_channel, name, slow_mode_seconds FROM group_info WHERE id = 1")?
+            .query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap_or((false, String::new(), 0));
+
+        // Only members with POST_IN_CHANNEL may post into a channel; regular members are read-only subscribers
+        if is_channel && !has_permission(&conn, &username, Permission::POST_IN_CHANNEL)? {
+            return Err(AppError::Forbidden("Only channel admins can post here".into()));
+        }
+
+        // Slow mode never applies to members who can manage slow mode (owners/moderators)
+        let bypasses_slow_mode = has_permission(&conn, &username, Permission::MANAGE_SLOW_MODE)?;
+        if slow_mode_seconds > 0 && !bypasses_slow_mode {
+            if let Err(remaining) = state.slow_mode_tracker.check_and_record(&username, slow_mode_seconds) {
+                return Err(AppError::BadRequest(format!(
+                    "Slow mode is on: wait {} more second(s)", remaining
+                )));
+            }
+        }
 
         // For channels, use channel name as sender; for groups, use username
         let sender = if is_channel {
@@ -307,9 +339,24 @@ pub async fn join_group(
             .query_row([&username], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(|_| AppError::Internal("Session not found".into()))?;
 
+        let (max_members, default_role_id): (i64, i64) = conn
+            .query_row("SELECT max_members, default_role_id FROM group_info WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap_or((500, 3));
+
+        let member_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM members", [], |r| r.get(0))
+            .unwrap_or(0);
+        if member_count >= max_members {
+            return Err(AppError::Forbidden("Group is full".into()));
+        }
+
+        let default_role_name: String = conn
+            .query_row("SELECT name FROM roles WHERE id = ?1", [default_role_id], |r| r.get(0))
+            .unwrap_or_else(|_| "member".to_string());
+
         conn.execute(
-            "INSERT INTO members (username, display_name, public_key, role) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![username, display_name, public_key, state.config.moderation.default_role],
+            "INSERT INTO members (username, display_name, public_key, role, role_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![username, display_name, public_key, default_role_name.to_lowercase(), default_role_id],
         )?;
 
         let group_name: String = conn
@@ -346,22 +393,9 @@ pub async fn leave_group(
     {
         let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
 
-        // Check if user is an owner
-        let user_role: Option<String> = conn
-            .prepare("SELECT role FROM members WHERE username = ?1")?
-            .query_row([&username], |r| r.get(0))
-            .ok();
-
-        if user_role.as_deref() == Some("owner") {
-            // Check if there are other owners
-            let owner_count: i64 = conn
-                .prepare("SELECT COUNT(*) FROM members WHERE role = 'owner'")?
-                .query_row([], |r| r.get(0))
-                .unwrap_or(0);
-
-            if owner_count <= 1 {
-                return Err(AppError::BadRequest("Last owner cannot leave the group".into()));
-            }
+        // An owner-equivalent member may only leave if at least one other owner remains
+        if is_owner_equivalent(&conn, &username)? && count_owner_equivalent_members(&conn)? <= 1 {
+            return Err(AppError::BadRequest("Last owner cannot leave the group".into()));
         }
 
         let deleted = conn.execute(
@@ -400,12 +434,24 @@ pub async fn get_public_channel_history(
     let ids: Vec<i64> = messages.iter()
         .filter_map(|m| m.get("id").and_then(|v| v.as_i64()))
         .collect();
-    let reactions_map = load_reactions_map(&conn, &ids);
+    let reactions_map = load_reactions_map(&conn, &ids, None);
+    let comment_previews = crate::handlers::comments::load_comment_previews(&conn, &ids);
     drop(conn);
     let messages: Vec<Value> = messages.into_iter().map(|mut m| {
         if let Some(id) = m.get("id").and_then(|v| v.as_i64()) {
             let r = reactions_map.get(&id).cloned().unwrap_or(json!({}));
-            m.as_object_mut().unwrap().insert("reactions".to_string(), r);
+            let obj = m.as_object_mut().unwrap();
+            obj.insert("reactions".to_string(), r);
+            match comment_previews.get(&id) {
+                Some(p) => {
+                    obj.insert("comment_count".to_string(), json!(p.count));
+                    obj.insert("last_comment_sender".to_string(), json!(p.last_sender));
+                    obj.insert("last_comment_content".to_string(), json!(p.last_content));
+                }
+                None => {
+                    obj.insert("comment_count".to_string(), json!(0));
+                }
+            }
         }
         m
     }).collect();
@@ -425,9 +471,22 @@ pub async fn get_my_role(
         .query_row([&username], |r| r.get(0))
         .unwrap_or_else(|_| "member".to_string());
 
+    let permissions_bits: Option<i64> = conn
+        .query_row(
+            "SELECT r.permissions FROM members m JOIN roles r ON r.id = m.role_id WHERE m.username = ?1",
+            [&username],
+            |r| r.get(0),
+        )
+        .ok();
+    let my_permissions = permissions_bits
+        .map(Permission::from_bits_truncate)
+        .unwrap_or(Permission::empty())
+        .to_names();
+
     Ok(Json(json!({
         "ok": true,
         "role": role,
+        "my_permissions": my_permissions,
     })))
 }
 
@@ -447,15 +506,20 @@ pub async fn delete_message(
             .query_row([&username], |r| r.get::<_, i64>(0))
             .map(|c| c > 0)
             .unwrap_or(false);
-
         if !is_member {
             return Err(AppError::Forbidden("Not a member".into()));
         }
 
-        conn.execute(
-            "DELETE FROM messages WHERE id = ?1 AND sender_username = ?2",
-            rusqlite::params![message_id, username],
-        )?
+        // DELETE_MESSAGES holders may delete anyone's message, in both groups
+        // and channels; everyone else may only delete their own.
+        if has_permission(&conn, &username, Permission::DELETE_MESSAGES)? {
+            conn.execute("DELETE FROM messages WHERE id = ?1", [message_id])?
+        } else {
+            conn.execute(
+                "DELETE FROM messages WHERE id = ?1 AND sender_username = ?2",
+                rusqlite::params![message_id, username],
+            )?
+        }
     };
 
     if rows_affected == 0 {
@@ -488,10 +552,12 @@ fn is_valid_emoji(s: &str) -> bool {
 }
 
 /// Load aggregated reactions for a list of message IDs.
-/// Returns { emoji -> [username, ...] } per message_id.
+/// Returns { emoji -> { "count": n, "reactedByMe": bool } } per message_id.
+/// Reactor identities are intentionally never exposed to clients — reactions are anonymous.
 pub fn load_reactions_map(
     conn: &Connection,
     message_ids: &[i64],
+    viewer_username: Option<&str>,
 ) -> HashMap<i64, Value> {
     if message_ids.is_empty() {
         return HashMap::new();
@@ -506,7 +572,7 @@ pub fn load_reactions_map(
         "SELECT message_id, emoji, reactor_username FROM message_reactions WHERE message_id IN ({}) ORDER BY message_id, emoji, created_at",
         placeholders
     );
-    let mut map: HashMap<i64, HashMap<String, Vec<String>>> = HashMap::new();
+    let mut map: HashMap<i64, HashMap<String, (i64, bool)>> = HashMap::new();
     if let Ok(mut stmt) = conn.prepare(&sql) {
         let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
             .iter()
@@ -520,11 +586,11 @@ pub fn load_reactions_map(
             ))
         }) {
             for row in rows.flatten() {
-                map.entry(row.0)
-                    .or_default()
-                    .entry(row.1)
-                    .or_default()
-                    .push(row.2);
+                let entry = map.entry(row.0).or_default().entry(row.1).or_insert((0, false));
+                entry.0 += 1;
+                if viewer_username == Some(row.2.as_str()) {
+                    entry.1 = true;
+                }
             }
         }
     }
@@ -532,7 +598,9 @@ pub fn load_reactions_map(
         .map(|(id, emoji_map)| {
             let v: serde_json::Map<String, Value> = emoji_map
                 .into_iter()
-                .map(|(emoji, users)| (emoji, Value::Array(users.into_iter().map(Value::String).collect())))
+                .map(|(emoji, (count, reacted_by_me))| {
+                    (emoji, json!({ "count": count, "reactedByMe": reacted_by_me }))
+                })
                 .collect();
             (id, Value::Object(v))
         })
@@ -574,21 +642,51 @@ pub async fn add_reaction(
             return Err(AppError::NotFound("Message not found".into()));
         }
 
+        // At most 2 distinct emojis per user per message (one of one kind,
+        // or two of different kinds). Adding an emoji the user already has
+        // is a harmless no-op via INSERT OR IGNORE below, so only a genuinely
+        // new (3rd+) emoji is blocked.
+        let already_has_this: bool = conn
+            .prepare("SELECT COUNT(*) FROM message_reactions WHERE message_id = ?1 AND reactor_username = ?2 AND emoji = ?3")?
+            .query_row(rusqlite::params![message_id, username, emoji], |r| r.get::<_, i64>(0))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !already_has_this {
+            let distinct_count: i64 = conn
+                .prepare("SELECT COUNT(DISTINCT emoji) FROM message_reactions WHERE message_id = ?1 AND reactor_username = ?2")?
+                .query_row(rusqlite::params![message_id, username], |r| r.get(0))
+                .unwrap_or(0);
+            if distinct_count >= 2 {
+                return Err(AppError::BadRequest("You can react with at most 2 different emojis per message".into()));
+            }
+        }
+
         conn.execute(
             "INSERT OR IGNORE INTO message_reactions (message_id, reactor_username, emoji) VALUES (?1, ?2, ?3)",
             rusqlite::params![message_id, username, emoji],
         )?;
 
-        let map = load_reactions_map(&conn, &[message_id]);
+        let map = load_reactions_map(&conn, &[message_id], Some(username.as_str()));
         map.get(&message_id).cloned().unwrap_or(json!({}))
     };
 
+    // Broadcast counts only — never the acting username, and never a
+    // per-viewer "reactedByMe" flag (this same packet fans out to every
+    // subscriber, so it cannot correctly reflect any one recipient's own
+    // state). The acting client gets its own accurate reactedByMe from the
+    // HTTP response above; everyone else just merges the updated counts.
+    let anon_reactions = {
+        let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
+        load_reactions_map(&conn, &[message_id], None)
+            .get(&message_id)
+            .cloned()
+            .unwrap_or(json!({}))
+    };
     let packet = json!({
         "type": "reaction_update",
         "group_id": 1,
         "message_id": message_id,
-        "reactions": reactions,
-        "actor": username,
+        "reactions": anon_reactions,
         "emoji": emoji,
         "action": "add",
     });
@@ -627,16 +725,22 @@ pub async fn remove_reaction(
             rusqlite::params![message_id, username, emoji],
         )?;
 
-        let map = load_reactions_map(&conn, &[message_id]);
+        let map = load_reactions_map(&conn, &[message_id], Some(username.as_str()));
         map.get(&message_id).cloned().unwrap_or(json!({}))
     };
 
+    let anon_reactions = {
+        let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
+        load_reactions_map(&conn, &[message_id], None)
+            .get(&message_id)
+            .cloned()
+            .unwrap_or(json!({}))
+    };
     let packet = json!({
         "type": "reaction_update",
         "group_id": 1,
         "message_id": message_id,
-        "reactions": reactions,
-        "actor": username,
+        "reactions": anon_reactions,
         "emoji": emoji,
         "action": "remove",
     });
@@ -667,11 +771,16 @@ pub async fn edit_message(
             .query_row([&username], |r| r.get::<_, i64>(0))
             .map(|c| c > 0)
             .unwrap_or(false);
-
         if !is_member {
             return Err(AppError::Forbidden("Not a member".into()));
         }
 
+        // Editing someone else's message is never allowed, for anyone —
+        // there is no "edit any message" permission. Note that channel posts
+        // are stored under the channel's own name as sender_username (see
+        // delete_message), not any individual poster's username, so channel
+        // messages can never match this check and are permanently uneditable
+        // after posting; that is an intentional consequence, not a bug.
         conn.execute(
             "UPDATE messages SET content = ?1 WHERE id = ?2 AND sender_username = ?3",
             rusqlite::params![new_content, message_id, username],

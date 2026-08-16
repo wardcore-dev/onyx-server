@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::time::Duration;
 
-pub const CURRENT_VERSION: &str = "v0.7-beta";
+pub const CURRENT_VERSION: &str = "v0.8-beta";
 const GITHUB_API: &str = "https://api.github.com/repos/wardcore-dev/onyx-server/releases/latest";
 
 #[derive(Deserialize)]

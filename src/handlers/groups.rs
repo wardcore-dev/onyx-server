@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use crate::auth::AuthUser;
 use crate::error::AppError;
+use crate::models::permission::Permission;
+use crate::permissions::has_permission;
 use crate::server::AppState;
 
 #[derive(Deserialize)]
@@ -27,20 +29,14 @@ pub async fn rename_group(
         return Err(AppError::NotFound("Group not found".into()));
     }
 
-    // Check if user is owner
-    let is_owner = {
+    // Check permission
+    let can_manage = {
         let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
-        let role: String = conn
-            .prepare("SELECT role FROM members WHERE username = ?1")
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .query_row([&username], |r| r.get(0))
-            .map_err(|_| AppError::Unauthorized("Not a member".into()))?;
-
-        role == "owner"
+        has_permission(&conn, &username, Permission::MANAGE_SETTINGS)?
     };
 
-    if !is_owner {
-        return Err(AppError::Forbidden("Only owner can rename the group".into()));
+    if !can_manage {
+        return Err(AppError::Forbidden("Insufficient permissions to rename the group".into()));
     }
 
     // Validate name
@@ -90,20 +86,14 @@ pub async fn upload_group_avatar(
         return Err(AppError::NotFound("Group not found".into()));
     }
 
-    // Check if user is owner
-    let is_owner = {
+    // Check permission
+    let can_manage = {
         let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
-        let role: String = conn
-            .prepare("SELECT role FROM members WHERE username = ?1")
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .query_row([&username], |r| r.get(0))
-            .map_err(|_| AppError::Unauthorized("Not a member".into()))?;
-
-        role == "owner"
+        has_permission(&conn, &username, Permission::MANAGE_SETTINGS)?
     };
 
-    if !is_owner {
-        return Err(AppError::Forbidden("Only owner can change the group avatar".into()));
+    if !can_manage {
+        return Err(AppError::Forbidden("Insufficient permissions to change the group avatar".into()));
     }
 
     // Parse multipart form data
@@ -232,20 +222,14 @@ pub async fn delete_group_avatar(
         return Err(AppError::NotFound("Group not found".into()));
     }
 
-    // Check if user is owner
-    let is_owner = {
+    // Check permission
+    let can_manage = {
         let conn = state.db.lock().map_err(|_| AppError::Internal("db lock".into()))?;
-        let role: String = conn
-            .prepare("SELECT role FROM members WHERE username = ?1")
-            .map_err(|e| AppError::Internal(e.to_string()))?
-            .query_row([&username], |r| r.get(0))
-            .map_err(|_| AppError::Unauthorized("Not a member".into()))?;
-
-        role == "owner"
+        has_permission(&conn, &username, Permission::MANAGE_SETTINGS)?
     };
 
-    if !is_owner {
-        return Err(AppError::Forbidden("Only owner can delete the group avatar".into()));
+    if !can_manage {
+        return Err(AppError::Forbidden("Insufficient permissions to delete the group avatar".into()));
     }
 
     // Delete all possible avatar files using config storage path with server-specific subfolder
